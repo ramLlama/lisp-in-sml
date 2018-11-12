@@ -3,7 +3,8 @@ fun say m = print (m ^ "\n")
 structure AST =
 struct
   (**
-   * atom      ::= n | sym |lambda (sym, ..., sym, [*sym]) sexp
+   * atom      ::= n | sym |lambda (sym, ..., sym) sexp
+   * primop    ::= + | - | * | /
    * sexp-elem ::= atom | sexp
    * sexp      ::= (sexp-elem, ..., sexp-elem)
    * program   ::= sexp, ..., sexp
@@ -45,15 +46,20 @@ end
 
 structure Lex:
           sig
-            datatype token = Open | Close | Lambda | Token of string
+            datatype keyword = Lambda | Add | Subtract | Multiply | Divide
+            datatype token = Open
+                           | Close
+                           | Keyword of keyword
+                           | Token of string
             val lex: string -> token list
           end =
 struct
-  datatype token = Open | Close | Lambda | Token of string
+  datatype keyword = Lambda | Add | Subtract | Multiply | Divide
+  datatype token = Open | Close | Keyword of keyword | Token of string
 
   val keywordMap = [("(", Open),
                     (")", Close),
-                    ("lambda", Lambda)]
+                    ("lambda", Keyword Lambda)]
 
   fun stringToToken (tokenString: string): token =
       case List.find (fn (keyword, _) => keyword = tokenString) keywordMap
@@ -101,7 +107,7 @@ struct
 
   fun parseLambda (tokens: Lex.token list): AST.atom * Lex.token list =
       case tokens
-       of Lex.Open::Lex.Lambda::tokens' =>
+       of Lex.Open::(Lex.Keyword Lex.Lambda)::tokens' =>
           let
             val (params, bodyTokens) = parseParams tokens'
             val (body, lambdaCloseTokens) = parseSexp bodyTokens
@@ -119,7 +125,7 @@ struct
           let
             val (element, tokens') =
                 case tokens
-                 of Lex.Open::Lex.Lambda::_ =>
+                 of Lex.Open::(Lex.Keyword Lex.Lambda)::_ =>
                     let
                       val (lambda, tokens') = parseLambda tokens
                     in
@@ -164,19 +170,24 @@ end
 
 structure Context =
 struct
-  type t = (string * AST.atom) list
+  type 'a t = (string * 'a) list
 
-  fun find (ctxs: t list, sym: string): AST.atom =
+  fun find (ctxs: 'a t list, sym: string): 'a =
       case ctxs
        of [] => raise Fail ("Could not find symbol \"" ^ sym ^ "\"")
         | ctx::ctxs' => case List.find (fn (candSym, _) => candSym = sym) ctx
                          of NONE => find (ctxs', sym)
-                          | SOME (_, atom) => atom
+                          | SOME (_, binding) => binding
 
-  fun push (ctxs: t list, ctx: t) = ctx::ctxs
+  fun push (ctxs: 'a t list, ctx: 'a t) = ctx::ctxs
 end
 
-structure Evaluate: sig val eval: AST.program -> AST.atom list end =
+structure Evaluate:
+          sig
+            type value
+            val eval: AST.program -> value list
+            val valueToString: value -> string
+          end =
 struct
   (**
    * ## Dynamics
@@ -225,7 +236,36 @@ struct
    * - |- [a_0, ..., a_n] val
    *)
 
-  fun bind (params: AST.symbol list, args: AST.atom list): Context.t =
+  datatype prim = Add | Subtract | Multiply | Divide
+
+  datatype value = Number of real
+                 | Lambda of AST.symbol list * AST.sexp
+                 | Prim of prim
+
+  fun primToString (prim: prim): string =
+      case prim
+       of Add => "+"
+        | Subtract => "-"
+        | Multiply => "*"
+        | Divide => "/"
+
+  fun valueToString (value: value): string =
+      case value
+       of Number n => Real.toString n
+        | Lambda (params, body) =>
+          String.concat ["(lambda ",
+                         "(", String.concatWith " " params, ")",
+                         " ",
+                         AST.sexpToString body,
+                         ")"]
+        | Prim prim => primToString prim
+
+  fun numberOf (value: value): real =
+      case value
+       of Number n => n
+        | _ => raise Fail ((valueToString value) ^ " is not a number")
+
+  fun bind (params: AST.symbol list, args: value list): value Context.t =
       case (params, args)
        of ([], []) => []
         | (_, []) => raise Fail "More params than args"
@@ -233,38 +273,62 @@ struct
         | (param::params', arg::args') =>
           (param, arg)::(bind (params', args'))
 
-  fun evalAtom (ctxs: Context.t list)
-               (atom: AST.atom): AST.atom =
-      case atom
-       of AST.Number _ => atom
-        | AST.Symbol symbol => evalAtom ctxs (Context.find (ctxs, symbol))
-        | AST.Lambda _ => atom
+  fun evalArith (prim: prim) (args: value list): value =
+      let
+        val primop = case prim
+                      of Add => Real.+
+                       | Subtract => (fn (elt, acc) => Real.- (acc, elt))
+                       | Multiply => Real.*
+                       | Divide => (fn (elt, acc) => Real./ (acc, elt))
+      in
+        case List.getItem (List.map numberOf args)
+         of NONE => raise Fail ("Applied prim " ^
+                                (primToString prim) ^
+                                " to zero arguments")
+         | SOME (first, rest) => Number (List.foldl primop first rest)
+      end
 
-  fun evalSexpElement (ctxs: Context.t list)
-                      (element: AST.sexp_element): AST.atom =
+  fun evalPrim (prim: prim) (args: value list): value =
+      evalArith prim args
+
+  fun evalAtom (ctxs: value Context.t list)
+               (atom: AST.atom): value =
+      case atom
+       of AST.Number n => Number n
+        | AST.Symbol symbol => Context.find (ctxs, symbol)
+        | AST.Lambda (params, body) => Lambda (params, body)
+
+  fun evalSexpElement (ctxs: value Context.t list)
+                      (element: AST.sexp_element): value =
       case element
        of AST.SEAtom atom => evalAtom ctxs atom
         | AST.SESexp sexp => evalSexp ctxs sexp
 
-  and evalSexp (ctxs: Context.t list)
-               (sexp as AST.Sexp elements: AST.sexp): AST.atom =
+  and evalSexp (ctxs: value Context.t list)
+               (sexp as AST.Sexp elements: AST.sexp): value =
       let
         val reducedElements = List.map (evalSexpElement ctxs) elements
       in
         case reducedElements
-         of [atom] => evalAtom ctxs atom
-          | (AST.Lambda (params, body))::args =>
+         of [value] => value
+          | (Lambda (params, body))::args =>
             let
               val ctx = bind (params, args)
             in
               evalSexp (Context.push (ctxs, ctx)) body
             end
+          | (Prim prim)::args => evalPrim prim args
           | _ =>
             raise Fail ((AST.sexpToString sexp) ^ " is not a function call!!")
       end
 
-  fun eval (program: AST.program): AST.atom list =
-      List.map (evalSexp []) program
+  val baseContext = [("+", Prim Add),
+                     ("-", Prim Subtract),
+                     ("*", Prim Multiply),
+                     ("/", Prim Divide)]
+
+  fun eval (program: AST.program): value list =
+      List.map (evalSexp [baseContext]) program
 end
 
 fun repl () =
@@ -276,7 +340,8 @@ fun repl () =
       val result = Evaluate.eval program
       val _ = say ("Evaluated to:\n" ^
                    (String.concatWith "\n"
-                                      (List.map AST.atomToString result)))
+                                      (List.map Evaluate.valueToString
+                                                result)))
     in
       repl ()
     end
