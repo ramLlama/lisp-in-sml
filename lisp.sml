@@ -3,8 +3,8 @@ fun say m = print (m ^ "\n")
 structure AST =
 struct
   (**
-   * atom      ::= n | sym |lambda (sym, ..., sym) sexp
-   * primop    ::= + | - | * | /
+   * atom      ::= n | sym | lambda (sym, ..., sym) sexp
+   * primop    ::= + | - | * | / | eq | lt
    * sexp-elem ::= atom | sexp
    * sexp      ::= (sexp-elem, ..., sexp-elem)
    * program   ::= sexp, ..., sexp
@@ -172,6 +172,14 @@ structure Context =
 struct
   type 'a t = (string * 'a) list
 
+  fun make (symbols: string list, values: 'a list): 'a t =
+      case (symbols, values)
+       of ([], []) => []
+        | (_, []) => raise Fail "More symbols than values"
+        | ([], _) => raise Fail "More values than symbols"
+        | (symbol::symbols', value::values') =>
+          (symbol, value)::(make (symbols', values'))
+
   fun find (ctxs: 'a t list, sym: string): 'a =
       case ctxs
        of [] => raise Fail ("Could not find symbol \"" ^ sym ^ "\"")
@@ -236,11 +244,14 @@ struct
    * - |- [a_0, ..., a_n] val
    *)
 
-  datatype prim = Add | Subtract | Multiply | Divide
+  datatype prim = Add | Subtract | Multiply | Divide | Equal | Lesser
 
   datatype value = Number of real
                  | Lambda of AST.symbol list * AST.sexp
                  | Prim of prim
+
+  val trueValue = Number 1.0
+  val falseValue = Number 0.0
 
   fun primToString (prim: prim): string =
       case prim
@@ -248,6 +259,8 @@ struct
         | Subtract => "-"
         | Multiply => "*"
         | Divide => "/"
+        | Equal => "eq"
+        | Lesser => "<"
 
   fun valueToString (value: value): string =
       case value
@@ -265,31 +278,66 @@ struct
        of Number n => n
         | _ => raise Fail ((valueToString value) ^ " is not a number")
 
-  fun bind (params: AST.symbol list, args: value list): value Context.t =
-      case (params, args)
-       of ([], []) => []
-        | (_, []) => raise Fail "More params than args"
-        | ([], _) => raise Fail "More args than params"
-        | (param::params', arg::args') =>
-          (param, arg)::(bind (params', args'))
+  fun evalArith (primop: real * real -> real)
+                (prim: prim)
+                (args: value list): value =
+      case List.map numberOf args
+         of [] => raise Fail ("Applied prim " ^
+                              (primToString prim) ^
+                              " to zero arguments")
+          | first::rest => Number (List.foldl primop first rest)
 
-  fun evalArith (prim: prim) (args: value list): value =
+  fun evalEq (prim: prim) (args: value list): value =
+      case args
+       of [] => trueValue
+        | first::rest =>
+          let
+            fun equal value =
+                case (first, value)
+                 of (Number n1, Number n2) => Real.==(n1, n2)
+                  | (Prim p1, Prim p2) => p1 = p2
+                  | _  => false
+          in
+            if List.all equal rest
+            then trueValue
+            else falseValue
+          end
+
+  fun evalLt (prim: prim) (args: value list): value =
       let
-        val primop = case prim
-                      of Add => Real.+
-                       | Subtract => (fn (elt, acc) => Real.- (acc, elt))
-                       | Multiply => Real.*
-                       | Divide => (fn (elt, acc) => Real./ (acc, elt))
+        fun ltFolder (value: value,
+                      (previous: real, result: bool)): real * bool =
+            if result
+            then case value
+                  of Number n => (n, Real.<(previous, n))
+                   | _ => (previous, false)
+            else (previous, result)
       in
-        case List.getItem (List.map numberOf args)
-         of NONE => raise Fail ("Applied prim " ^
-                                (primToString prim) ^
-                                " to zero arguments")
-         | SOME (first, rest) => Number (List.foldl primop first rest)
+        case args
+         of [] => trueValue
+          | first::rest =>
+            let
+              val (_, result) =
+                  List.foldl ltFolder (numberOf first, true) rest
+            in
+              if result
+              then trueValue
+              else falseValue
+            end
       end
 
+  val primDefinitions: (prim * (prim -> value list -> value)) list =
+      [(Add, evalArith Real.+),
+       (Subtract, evalArith (fn (elt, acc) => Real.- (acc, elt))),
+       (Multiply, evalArith Real.* ),
+       (Divide, evalArith (fn (elt, acc) => Real./ (acc, elt))),
+       (Equal, evalEq),
+       (Lesser, evalLt)]
+
   fun evalPrim (prim: prim) (args: value list): value =
-      evalArith prim args
+      case List.find (fn (candPrim, _) => candPrim = prim) primDefinitions
+       of NONE => raise Fail ("No definition for prim " ^ (primToString prim))
+        | SOME (_, f) => f prim args
 
   fun evalAtom (ctxs: value Context.t list)
                (atom: AST.atom): value =
@@ -313,7 +361,7 @@ struct
          of [value] => value
           | (Lambda (params, body))::args =>
             let
-              val ctx = bind (params, args)
+              val ctx = Context.make (params, args)
             in
               evalSexp (Context.push (ctxs, ctx)) body
             end
@@ -325,25 +373,35 @@ struct
   val baseContext = [("+", Prim Add),
                      ("-", Prim Subtract),
                      ("*", Prim Multiply),
-                     ("/", Prim Divide)]
+                     ("/", Prim Divide),
+                     ("eq", Prim Equal),
+                     ("<", Prim Lesser)]
 
   fun eval (program: AST.program): value list =
       List.map (evalSexp [baseContext]) program
 end
 
-fun repl () =
+fun repl (printParse: bool) =
     let
       val program =
           (Parse.parse o Lex.lex o valOf o TextIO.inputLine) TextIO.stdIn
-      val _ = say ("Parsed to:\n" ^ (AST.programToString program))
+      val _ = if printParse
+              then say ("Parsed to:\n" ^ (AST.programToString program))
+              else ()
 
       val result = Evaluate.eval program
-      val _ = say ("Evaluated to:\n" ^
-                   (String.concatWith "\n"
-                                      (List.map Evaluate.valueToString
-                                                result)))
+      val _ = say (String.concatWith "\n"
+                                     (List.map Evaluate.valueToString
+                                               result))
     in
-      repl ()
+      repl printParse
     end
 
-val _ = repl ()
+local
+    val argvs = CommandLine.arguments ()
+in
+    fun optionEnabled option =
+        List.exists (fn argv => argv = ("--" ^ option)) argvs
+end
+
+val _ = repl (optionEnabled "print-parse")
