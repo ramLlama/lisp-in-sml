@@ -4,7 +4,7 @@ structure AST =
 struct
   (**
    * atom      ::= n | sym | lambda (sym, ..., sym) sexp
-   * primop    ::= + | - | * | / | eq | lt
+   * primop    ::= + | - | * | / | eq | lt | nand
    * sexp-elem ::= atom | sexp
    * sexp      ::= (sexp-elem, ..., sexp-elem)
    * program   ::= sexp, ..., sexp
@@ -75,7 +75,6 @@ struct
                                                | _ => String.str c)
                                          source
         val rawTokens = String.tokens (Char.contains " \n") spacified
-                                      (* val _ = List.app say tokens *)
       in
         List.map stringToToken rawTokens
       end
@@ -244,7 +243,13 @@ struct
    * - |- [a_0, ..., a_n] val
    *)
 
-  datatype prim = Add | Subtract | Multiply | Divide | Equal | Lesser
+  datatype prim = Add
+                | Subtract
+                | Multiply
+                | Divide
+                | Equal
+                | Lesser
+                | Nand
 
   datatype value = Number of real
                  | Lambda of AST.symbol list * AST.sexp
@@ -261,6 +266,7 @@ struct
         | Divide => "/"
         | Equal => "eq"
         | Lesser => "<"
+        | Nand => "nand"
 
   fun valueToString (value: value): string =
       case value
@@ -295,7 +301,6 @@ struct
             fun equal value =
                 case (first, value)
                  of (Number n1, Number n2) => Real.==(n1, n2)
-                  | (Prim p1, Prim p2) => p1 = p2
                   | _  => false
           in
             if List.all equal rest
@@ -326,13 +331,26 @@ struct
             end
       end
 
+  fun evalNand (prim: prim) (args: value list): value =
+      let
+        fun andFolder (value: value, acc: bool): bool =
+            case value
+             of Number n => acc andalso (not (Real.== (n, 0.0)))
+              | _ => false
+      in
+        if not (List.foldl andFolder true args)
+        then trueValue
+        else falseValue
+      end
+
   val primDefinitions: (prim * (prim -> value list -> value)) list =
       [(Add, evalArith Real.+),
        (Subtract, evalArith (fn (elt, acc) => Real.- (acc, elt))),
        (Multiply, evalArith Real.* ),
        (Divide, evalArith (fn (elt, acc) => Real./ (acc, elt))),
        (Equal, evalEq),
-       (Lesser, evalLt)]
+       (Lesser, evalLt),
+       (Nand , evalNand)]
 
   fun evalPrim (prim: prim) (args: value list): value =
       case List.find (fn (candPrim, _) => candPrim = prim) primDefinitions
@@ -370,12 +388,58 @@ struct
             raise Fail ((AST.sexpToString sexp) ^ " is not a function call!!")
       end
 
+
   val baseContext = [("+", Prim Add),
                      ("-", Prim Subtract),
                      ("*", Prim Multiply),
                      ("/", Prim Divide),
                      ("eq", Prim Equal),
-                     ("<", Prim Lesser)]
+                     ("<", Prim Lesser),
+                     ("nand", Prim Nand)]
+  local
+    val sexp = AST.Sexp
+    val symatom = AST.SEAtom o AST.Symbol
+    val sexpse = AST.SESexp o sexp
+  in
+    (* (defun not (x) (nand x)) *)
+    val notSexp =
+        Lambda (["x"],
+                sexp [symatom "nand",
+                      symatom "x"])
+    val baseContext = ("not", notSexp)::baseContext
+
+    (* (defun and (x y) (not (nand x y))) *)
+    val andSexp =
+        Lambda (["x", "y"],
+                sexp [symatom "not",
+                      sexpse [symatom "nand", symatom "x", symatom "y"]])
+    val baseContext = ("and", andSexp)::baseContext
+
+    (* (defun or (x y) (not (and (not x) (not y)))) *)
+    val orSexp =
+        Lambda (["x", "y"],
+                sexp [symatom "not",
+                      sexpse [symatom "and",
+                              sexpse [symatom "not",
+                                      symatom "x"],
+                              sexpse [symatom "not",
+                                      symatom "y"]]])
+    val baseContext = ("or", orSexp)::baseContext
+
+    (* (defun > (x y) (and (not (< x y)) (not (eq x y)))) *)
+    val gtSexp =
+        Lambda (["x", "y"],
+                sexp [symatom "and",
+                      sexpse [symatom "not",
+                              sexpse [symatom "<",
+                                      symatom "x",
+                                      symatom "y"]],
+                      sexpse [symatom "not",
+                              sexpse [symatom "eq",
+                                      symatom "x",
+                                      symatom "y"]]])
+    val baseContext = (">", gtSexp)::baseContext
+  end
 
   fun eval (program: AST.program): value list =
       List.map (evalSexp [baseContext]) program
