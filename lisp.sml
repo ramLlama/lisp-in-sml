@@ -1,9 +1,14 @@
 fun say m = print (m ^ "\n")
 
+fun assert cond msg =
+    if cond
+    then ()
+    else raise Fail msg
+
 structure AST =
 struct
   (**
-   * atom      ::= n | sym | lambda (sym, ..., sym) sexp
+   * atom      ::= n | sym | lambda (sym, ..., sym) sexp | if sexp sexp sexp
    * primop    ::= + | - | * | / | eq | lt | nand
    * sexp-elem ::= atom | sexp
    * sexp      ::= (sexp-elem, ..., sexp-elem)
@@ -13,6 +18,7 @@ struct
   datatype atom = Number of real
                 | Symbol of symbol
                 | Lambda of symbol list * sexp
+                | If of sexp * sexp * sexp
        and sexp_element = SEAtom of atom
                         | SESexp of sexp
        and sexp = Sexp of sexp_element list
@@ -20,46 +26,92 @@ struct
 
   fun atomToString (atom: atom): string =
       case atom
-       of Number x => Real.toString x
-        | Symbol symbol => symbol
+       of Number x => String.concat ["NUM[", Real.toString x, "]"]
+        | Symbol symbol => String.concat ["SYM[", symbol, "]"]
         | Lambda (params, body) =>
-          String.concat ["(lambda ",
-                         "(", String.concatWith " " params, ")",
-                         " ",
+          String.concat ["LAMBDA[",
+                         "[", String.concatWith ", " params, "]",
+                         ", ",
                          sexpToString body,
-                         ")"]
+                         "]"]
+        | If (cond, trueBody, falseBody) =>
+          String.concat ["IF[",
+                         sexpToString cond,
+                         ", ",
+                         sexpToString trueBody,
+                         ", ",
+                         sexpToString falseBody,
+                         "]"]
+
   and sexpElementToString (element: sexp_element): string =
       case element
        of SEAtom atom => atomToString atom
         | SESexp sexp => sexpToString sexp
+
   and sexpToString (Sexp elements: sexp): string =
       let
         val elementsString =
-            String.concatWith " " (List.map sexpElementToString elements)
+            String.concatWith ", " (List.map sexpElementToString elements)
+      in
+        String.concat ["SEXP[", elementsString, "]"]
+      end
+
+  fun atomToPrettyString (atom: atom): string =
+      case atom
+       of Number x => Real.toString x
+        | Symbol symbol => symbol
+        | Lambda (params, body) =>
+          String.concat ["lambda ",
+                         "(", String.concatWith " " params, ")",
+                         " ",
+                         sexpToPrettyString body]
+        | If (cond, trueBody, falseBody) =>
+          String.concat ["if ",
+                         sexpToPrettyString cond,
+                         " ",
+                         sexpToPrettyString trueBody,
+                         " ",
+                         sexpToPrettyString falseBody]
+
+  and sexpElementToPrettyString (element: sexp_element): string =
+      case element
+       of SEAtom atom => atomToPrettyString atom
+        | SESexp sexp => sexpToPrettyString sexp
+
+  and sexpToPrettyString (Sexp elements: sexp): string =
+      let
+        val elementsString =
+            String.concatWith " "
+                              (List.map sexpElementToPrettyString elements)
       in
         String.concat ["(", elementsString, ")"]
       end
 
   fun programToString (sexps: program): string =
-      String.concatWith "\n" (List.map sexpToString sexps)
+      String.concatWith "\n"
+                        ["PRG[",
+                         String.concatWith "\n" (List.map sexpToString sexps),
+                         "]"]
 end
 
 structure Lex:
           sig
-            datatype keyword = Lambda | Add | Subtract | Multiply | Divide
+            datatype keyword = Lambda | If
             datatype token = Open
                            | Close
                            | Keyword of keyword
                            | Token of string
             val lex: string -> token list
+            val tokenToString: token -> string
           end =
 struct
-  datatype keyword = Lambda | Add | Subtract | Multiply | Divide
+  datatype keyword = Lambda | If
   datatype token = Open | Close | Keyword of keyword | Token of string
 
   val keywordMap = [("(", Open),
                     (")", Close),
-                    ("lambda", Keyword Lambda)]
+                    ("lambda", Keyword Lambda),
+                    ("if", Keyword If)]
 
   fun stringToToken (tokenString: string): token =
       case List.find (fn (keyword, _) => keyword = tokenString) keywordMap
@@ -78,6 +130,20 @@ struct
       in
         List.map stringToToken rawTokens
       end
+
+  fun keywordToString (keyword: keyword): string =
+      case keyword
+       of Lambda => "lambda"
+        | If => "if"
+
+  fun tokenToString (token: token): string =
+      case token
+       of Open => "OP"
+        | Close => "CL"
+        | Keyword keyword =>
+          String.concat ["KW[", keywordToString keyword, "]"]
+        | Token tokenString =>
+          String.concat ["TK[", tokenString, "]"]
 end
 
 structure Parse: sig val parse: Lex.token list -> AST.program end =
@@ -106,14 +172,27 @@ struct
 
   fun parseLambda (tokens: Lex.token list): AST.atom * Lex.token list =
       case tokens
-       of Lex.Open::(Lex.Keyword Lex.Lambda)::tokens' =>
+       of (Lex.Keyword Lex.Lambda)::tokens' =>
           let
             val (params, bodyTokens) = parseParams tokens'
-            val (body, lambdaCloseTokens) = parseSexp bodyTokens
+            val (body, remainingTokens) = parseSexp bodyTokens
+            val _ = assert (hd remainingTokens = Lex.Close)
+                           "lambda sexp has more than 2 sexps"
           in
-            case lambdaCloseTokens
-             of Lex.Close::remainingTokens =>
-                (AST.Lambda (params, body), remainingTokens)
+            (AST.Lambda (params, body), remainingTokens)
+          end
+
+  and parseIf (tokens: Lex.token list): AST.atom * Lex.token list =
+      case tokens
+       of (Lex.Keyword Lex.If)::condTokens =>
+          let
+            val (cond, trueBodyTokens) = parseSexp condTokens
+            val (trueBody, falseBodyTokens) = parseSexp trueBodyTokens
+            val (falseBody, remainingTokens) = parseSexp falseBodyTokens
+            val _ = assert (hd remainingTokens = Lex.Close)
+                           "If sexp has more than 3 sexps"
+          in
+            (AST.If (cond, trueBody, falseBody), remainingTokens)
           end
 
   and parseSexpElements (tokens: Lex.token list):
@@ -124,11 +203,17 @@ struct
           let
             val (element, tokens') =
                 case tokens
-                 of Lex.Open::(Lex.Keyword Lex.Lambda)::_ =>
+                 of (Lex.Keyword Lex.Lambda)::_ =>
                     let
-                      val (lambda, tokens') = parseLambda tokens
+                      val (atom, tokens') = parseLambda tokens
                     in
-                      (AST.SEAtom lambda, tokens')
+                      (AST.SEAtom atom, tokens')
+                    end
+                  | (Lex.Keyword Lex.If)::_ =>
+                    let
+                      val (atom, tokens') = parseIf tokens
+                    in
+                      (AST.SEAtom atom, tokens')
                     end
                   | Lex.Open::_ =>
                     let
@@ -216,6 +301,21 @@ struct
    * Ctx |- sym --> Ctx |- Ctx[sym]
    *
    *
+   * Ctx |- cond --> cond'
+   * -------------------------------------------------------
+   * Ctx |- if cond body_t body_f --> if cond' body_t body_f
+   *
+   *
+   * a_cond = n    n != 0
+   * -----------------------------------------
+   * Ctx |- if a_cond body_t body_f --> body_t
+   *
+   *
+   * a_cond = n    n = 0
+   * -----------------------------------------
+   * Ctx |- if a_cond body_t body_f --> body_f
+   *
+   *
    * sexp:
    * Ctx |- s_i --> s_i'
    * --------------------------------------------
@@ -275,7 +375,7 @@ struct
           String.concat ["(lambda ",
                          "(", String.concatWith " " params, ")",
                          " ",
-                         AST.sexpToString body,
+                         AST.sexpToPrettyString body,
                          ")"]
         | Prim prim => primToString prim
 
@@ -363,8 +463,13 @@ struct
        of AST.Number n => Number n
         | AST.Symbol symbol => Context.find (ctxs, symbol)
         | AST.Lambda (params, body) => Lambda (params, body)
+        | AST.If (cond, trueBody, falseBody) =>
+          case evalSexp ctxs cond
+           of Number n => if Real.== (n, 0.0)
+                          then evalSexp ctxs falseBody
+                          else evalSexp ctxs trueBody
 
-  fun evalSexpElement (ctxs: value Context.t list)
+  and evalSexpElement (ctxs: value Context.t list)
                       (element: AST.sexp_element): value =
       case element
        of AST.SEAtom atom => evalAtom ctxs atom
