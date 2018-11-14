@@ -8,7 +8,7 @@ fun assert cond msg =
 structure AST =
 struct
   (**
-   * atom      ::= n | sym | lambda (sym, ..., sym) sexp | if sexp sexp sexp
+   * atom      ::= n | sym | lambda (sym ... sym) sexp | if sexp sexp sexp
    * primop    ::= + | - | * | / | eq | lt | nand
    * sexp-elem ::= atom | sexp
    * sexp      ::= (sexp-elem, ..., sexp-elem)
@@ -565,8 +565,12 @@ fun getInput (): string list =
 
 fun repl (printParse: bool) =
     let
-      val program =
-          (Parse.parse o Lex.lex o String.concat o getInput) ()
+      val input = (String.concat o getInput) ()
+      val _ = if input = "exit"
+              then OS.Process.exit OS.Process.success
+              else ()
+
+      val program = (Parse.parse o Lex.lex) input
       val _ = if printParse
               then say ("Parsed to:\n" ^ (AST.programToString program))
               else ()
