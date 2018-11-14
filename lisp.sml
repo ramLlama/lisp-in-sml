@@ -550,10 +550,23 @@ struct
       List.map (evalSexp [baseContext]) program
 end
 
+
+fun getInput (): string list =
+    case TextIO.inputLine TextIO.stdIn
+     of NONE => [""]
+      | SOME line =>
+        let
+          val followingLines = if line = "\n"
+                               then [""]
+                               else getInput ()
+        in
+          line::followingLines
+        end
+
 fun repl (printParse: bool) =
     let
       val program =
-          (Parse.parse o Lex.lex o valOf o TextIO.inputLine) TextIO.stdIn
+          (Parse.parse o Lex.lex o String.concat o getInput) ()
       val _ = if printParse
               then say ("Parsed to:\n" ^ (AST.programToString program))
               else ()
